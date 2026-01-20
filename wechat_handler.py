@@ -9,7 +9,8 @@ from database import (
     add_user, add_expense, get_today_summary, get_month_summary,
     add_recurring_expense, get_recurring_expenses, delete_recurring_expense,
     get_daily_debt, create_family, join_family, get_user_family, get_family_members, leave_family,
-    get_family_members_detail, get_family_debt_ranking
+    get_family_members_detail, get_family_debt_ranking,
+    get_family_recurring_expenses, get_family_daily_debt, update_nickname
 )
 
 
@@ -198,11 +199,34 @@ def parse_message(openid: str, content: str, notify_callback=None) -> str:
             return '👋 已成功退出家庭组。'
         else:
             return '❌ 您当前不在任何家庭组中。'
+    
+    # 修改昵称: 昵称 名字
+    match = re.match(r'^(?:昵称|改名|我叫)\s+(\S+)$', content)
+    if match:
+        nickname = match.group(1)
+        update_nickname(openid, nickname)
+        return f'✅ 昵称已更新为：{nickname}'
 
     if content == '家庭':
         family = get_user_family(openid)
         if family:
-            return f'👨‍👩‍👧‍👦 当前家庭：{family["name"]}\n邀请码：{family["invite_code"]}\n身份：{"创建者" if family["role"] == "creator" else "成员"}'
+            members = get_family_members_detail(family['id'])
+            
+            msg = f'''👨‍👩‍👧‍👦 {family["name"]}
+┌─────────────────────
+│ 邀请码：{family["invite_code"]}
+└─────────────────────
+
+👥 成员列表'''
+            
+            for m in members:
+                role_icon = '👑' if m['role'] == 'creator' else '👤'
+                nickname = m['nickname'] or f"用户{m['openid'][-4:]}"
+                is_me = " (我)" if m['openid'] == openid else ""
+                msg += f'\n{role_icon} {nickname}{is_me}'
+            
+            msg += '\n\n💡 发送「家庭欠款」查看排行'
+            return msg
         else:
             return '📋 您当前不在任何家庭组中。\n\n发送「创建家庭 名称」来创建一个吧！'
     
@@ -388,37 +412,72 @@ def get_month_report(openid: str) -> str:
 
 
 def get_recurring_report(openid: str) -> str:
-    """生成固定开支/贷款报告"""
-    expenses = get_recurring_expenses(openid)
-    debt = get_daily_debt(openid)
+    """生成固定开支/贷款报告（家庭共享）"""
+    family = get_user_family(openid)
+    
+    # 如果在家庭中，显示家庭共享账单
+    if family:
+        expenses = get_family_recurring_expenses(family['id'])
+        debt = get_family_daily_debt(family['id'])
+        title = f"👨‍👩‍👧‍👦 {family['name']} 共享账单"
+    else:
+        expenses = get_recurring_expenses(openid)
+        debt = get_daily_debt(openid)
+        title = "💰 欠款总览"
     
     if not expenses:
         return '📋 暂无固定开支/贷款记录\n\n发送「初始化」开始设置贷款和固定开支'
     
-    msg = f'''💸 每日欠款明细
-
-📌 每日合计：{debt["daily_total"]:.2f} 元
-📅 每月合计：{debt["monthly_total"]:,.2f} 元
-
-━━━━━━━━━━━━━━━━━'''
-    
-    # 按类型分组显示
-    type_icons = {'loan': '🏠', 'debt': '💳', 'fixed': '📝'}
-    type_names = {'loan': '贷款', 'debt': '负债', 'fixed': '固定'}
-    
+    # 按类型分组
+    type_groups = {'loan': [], 'debt': [], 'fixed': []}
     for e in expenses:
-        icon = type_icons.get(e['type'], '📌')
-        daily = round(e['monthly_amount'] / 30, 2)
-        
-        # 如果有总金额和月数，显示详情
-        if e.get('total_amount') and e.get('total_months'):
-            msg += f"\n{icon} [{e['id']}] {e['name']}"
-            msg += f"\n   总额{e['total_amount']:,.0f}÷{e['total_months']}月"
-            msg += f" = {e['monthly_amount']:,.0f}元/月 ({daily}元/日)"
+        exp_type = e.get('type', 'fixed')
+        if exp_type in type_groups:
+            type_groups[exp_type].append(e)
         else:
-            msg += f"\n{icon} [{e['id']}] {e['name']}：{e['monthly_amount']:,.0f}元/月 ({daily}元/日)"
+            type_groups['fixed'].append(e)
     
-    msg += '\n\n💡 发送"删除 ID"可删除对应项'
+    msg = f'''{title}
+┌─────────────────────
+│ 📌 每日：{debt["daily_total"]:,.2f} 元
+│ 📅 每月：{debt["monthly_total"]:,.2f} 元
+└─────────────────────'''
+    
+    type_config = {
+        'loan': ('🏠', '贷款'),
+        'debt': ('💳', '负债'),
+        'fixed': ('📝', '固定开支')
+    }
+    
+    for type_key, (icon, type_name) in type_config.items():
+        items = type_groups.get(type_key, [])
+        if not items:
+            continue
+            
+        msg += f"\n\n{icon} {type_name}"
+        msg += "\n" + "─" * 18
+        
+        for e in items:
+            daily = e['monthly_amount'] / 30
+            name = e['name']
+            
+            # 家庭模式显示归属人
+            owner_tag = ""
+            if family and e.get('nickname'):
+                owner_tag = f" [{e['nickname'] or '?'}]"
+            elif family and e.get('openid'):
+                owner_tag = f" [用户{e['openid'][-4:]}]"
+            
+            if e.get('total_amount') and e.get('total_months'):
+                msg += f"\n[{e['id']}] {name}{owner_tag}"
+                msg += f"\n    {e['total_amount']:,.0f} ÷ {e['total_months']}期"
+                msg += f"\n    → {e['monthly_amount']:,.0f}/月 | {daily:.0f}/日"
+            else:
+                msg += f"\n[{e['id']}] {name}{owner_tag}"
+                msg += f"\n    → {e['monthly_amount']:,.0f}/月 | {daily:.0f}/日"
+    
+    msg += '\n\n─────────────────────'
+    msg += '\n💡 删除命令：删除 ID'
     
     return msg
 

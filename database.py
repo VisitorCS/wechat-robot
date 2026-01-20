@@ -107,14 +107,26 @@ def init_db():
 
 
 def add_user(openid: str, nickname: str = None):
-    """添加或更新用户"""
+    """添加用户（如果不存在）"""
     with get_connection() as conn:
         cursor = conn.cursor()
+        # 只在用户不存在时插入，不覆盖已有记录
         cursor.execute('''
-            INSERT OR REPLACE INTO users (openid, nickname, created_at)
+            INSERT OR IGNORE INTO users (openid, nickname, created_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
         ''', (openid, nickname))
         conn.commit()
+
+
+def update_nickname(openid: str, nickname: str) -> bool:
+    """更新用户昵称"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE users SET nickname = ? WHERE openid = ?
+        ''', (nickname, openid))
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def add_expense(openid: str, expense_type: str, amount: float, 
@@ -354,6 +366,72 @@ def get_daily_debt(openid: str) -> dict:
             details.append({
                 'type': row['type'],
                 'name': row['name'],
+                'monthly': monthly,
+                'daily': daily
+            })
+        
+        return {
+            'daily_total': round(monthly_total / 30, 2),
+            'monthly_total': monthly_total,
+            'details': details
+        }
+
+
+def get_family_recurring_expenses(family_id: int) -> list:
+    """获取家庭所有成员的固定开支/贷款（共享账单）"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT r.id, r.openid, r.type, r.name, r.total_amount, r.total_months, 
+                   r.monthly_amount, r.start_date, r.end_date, u.nickname
+            FROM recurring_expenses r
+            JOIN family_members fm ON r.openid = fm.openid
+            LEFT JOIN users u ON r.openid = u.openid
+            WHERE fm.family_id = ? AND r.is_active = 1
+            ORDER BY r.type, r.monthly_amount DESC
+        ''', (family_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_family_daily_debt(family_id: int) -> dict:
+    """
+    计算家庭每日总欠款（所有成员的固定开支和贷款汇总）
+    
+    Returns:
+        {
+            'daily_total': 每日欠款总额,
+            'monthly_total': 每月欠款总额,
+            'details': [
+                {'name': '房贷', 'owner': '老公', 'monthly': 5000, 'daily': 166.67},
+                ...
+            ]
+        }
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT r.type, r.name, r.monthly_amount, u.nickname, r.openid
+            FROM recurring_expenses r
+            JOIN family_members fm ON r.openid = fm.openid
+            LEFT JOIN users u ON r.openid = u.openid
+            WHERE fm.family_id = ? AND r.is_active = 1
+            AND (r.end_date IS NULL OR r.end_date >= date('now'))
+        ''', (family_id,))
+        
+        rows = cursor.fetchall()
+        
+        details = []
+        monthly_total = 0
+        
+        for row in rows:
+            monthly = row['monthly_amount']
+            daily = round(monthly / 30, 2)
+            monthly_total += monthly
+            nickname = row['nickname'] or f"用户{row['openid'][-4:]}"
+            details.append({
+                'type': row['type'],
+                'name': row['name'],
+                'owner': nickname,
                 'monthly': monthly,
                 'daily': daily
             })
