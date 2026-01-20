@@ -8,17 +8,19 @@ import re
 from database import (
     add_user, add_expense, get_today_summary, get_month_summary,
     add_recurring_expense, get_recurring_expenses, delete_recurring_expense,
-    get_daily_debt
+    get_daily_debt, create_family, join_family, get_user_family, get_family_members, leave_family,
+    get_family_members_detail, get_family_debt_ranking
 )
 
 
-def parse_message(openid: str, content: str) -> str:
+def parse_message(openid: str, content: str, notify_callback=None) -> str:
     """
     解析用户消息并返回响应
     
     Args:
         openid: 用户 OpenID
         content: 消息内容
+        notify_callback: 用于发送通知的回调函数 (openid, message)
     
     Returns:
         响应文本
@@ -51,7 +53,34 @@ def parse_message(openid: str, content: str) -> str:
         category = match.group(2) or '其他'
         description = match.group(3) or None
         add_expense(openid, 'expense', amount, category, description)
-        return f'✅ 已记录支出 {amount} 元\n分类：{category}' + (f'\n备注：{description}' if description else '')
+        
+        response = f'✅ 已记录支出 {amount} 元\n分类：{category}' + (f'\n备注：{description}' if description else '')
+        
+        # 家庭组通知逻辑
+        family = get_user_family(openid)
+        if family and notify_callback:
+            members = get_family_members(family['id'])
+            month_summary = get_month_summary(openid)
+            debt = get_daily_debt(openid)
+            
+            notify_msg = f'''📢 家庭支出提醒
+
+成员：{"另一半" if family["role"] == "member" else "创建者"}
+物品：{category}
+金额：{amount:.2f} 元'''
+            if description:
+                notify_msg += f'\n备注：{description}'
+            
+            notify_msg += f'''
+
+📊 本月累计支出：{month_summary["expense"]:.2f} 元
+🏠 每日固定欠款：{debt["daily_total"]:.2f} 元'''
+            
+            for member_openid in members:
+                if member_openid != openid:
+                    notify_callback(member_openid, notify_msg)
+        
+        return response
     
     # 收入指令: 收入 金额 [分类] [备注]
     match = re.match(r'^收入\s+(\d+(?:\.\d+)?)\s*(\S*)\s*(.*)$', content)
@@ -62,23 +91,84 @@ def parse_message(openid: str, content: str) -> str:
         add_expense(openid, 'income', amount, category, description)
         return f'✅ 已记录收入 {amount} 元\n分类：{category}' + (f'\n备注：{description}' if description else '')
     
-    # 添加贷款: 贷款 名称 月供金额
+    # 添加贷款: 支持两种格式
+    # 格式1: 贷款 名称 总金额 月数 (如: 贷款 房贷 1000000 360)
+    # 格式2: 贷款 名称 月供金额 (如: 贷款 房贷 5000)
+    match = re.match(r'^(?:添加)?贷款\s+(\S+)\s+(\d+(?:\.\d+)?)\s+(\d+)$', content)
+    if match:
+        name = match.group(1)
+        total_amount = float(match.group(2))
+        total_months = int(match.group(3))
+        monthly = round(total_amount / total_months, 2)
+        daily = round(monthly / 30, 2)
+        add_recurring_expense(openid, 'loan', name, 
+                              total_amount=total_amount, total_months=total_months)
+        return f'''✅ 已添加贷款：{name}
+
+💰 总金额：{total_amount:,.0f} 元
+📅 还款期：{total_months} 个月
+📆 每月还：{monthly:,.2f} 元
+📌 每日均：{daily:.2f} 元'''
+    
+    # 贷款简化格式: 贷款 名称 月供
     match = re.match(r'^(?:添加)?贷款\s+(\S+)\s+(\d+(?:\.\d+)?)$', content)
     if match:
         name = match.group(1)
-        amount = float(match.group(2))
-        add_recurring_expense(openid, 'loan', name, amount)
-        daily = round(amount / 30, 2)
-        return f'✅ 已添加贷款：{name}\n每月：{amount} 元\n每日：{daily} 元'
+        monthly = float(match.group(2))
+        daily = round(monthly / 30, 2)
+        add_recurring_expense(openid, 'loan', name, monthly_amount=monthly)
+        return f'''✅ 已添加贷款：{name}
+
+📆 每月还：{monthly:,.2f} 元
+📌 每日均：{daily:.2f} 元'''
     
-    # 添加固定开支: 固定 名称 月金额
+    # 添加固定开支: 支持两种格式
+    # 格式1: 固定 名称 年费 12 (如: 固定 保险 3600 12)
+    # 格式2: 固定 名称 月费 (如: 固定 物业 200)
+    match = re.match(r'^(?:添加)?固定\s+(\S+)\s+(\d+(?:\.\d+)?)\s+(\d+)$', content)
+    if match:
+        name = match.group(1)
+        total_amount = float(match.group(2))
+        total_months = int(match.group(3))
+        monthly = round(total_amount / total_months, 2)
+        daily = round(monthly / 30, 2)
+        add_recurring_expense(openid, 'fixed', name,
+                              total_amount=total_amount, total_months=total_months)
+        return f'''✅ 已添加固定开支：{name}
+
+💰 总金额：{total_amount:,.0f} 元
+📅 周期：{total_months} 个月
+📆 每月均：{monthly:,.2f} 元
+📌 每日均：{daily:.2f} 元'''
+    
+    # 固定开支简化格式: 固定 名称 月费
     match = re.match(r'^(?:添加)?固定\s+(\S+)\s+(\d+(?:\.\d+)?)$', content)
     if match:
         name = match.group(1)
-        amount = float(match.group(2))
-        add_recurring_expense(openid, 'fixed', name, amount)
-        daily = round(amount / 30, 2)
-        return f'✅ 已添加固定开支：{name}\n每月：{amount} 元\n每日：{daily} 元'
+        monthly = float(match.group(2))
+        daily = round(monthly / 30, 2)
+        add_recurring_expense(openid, 'fixed', name, monthly_amount=monthly)
+        return f'''✅ 已添加固定开支：{name}
+
+📆 每月：{monthly:,.2f} 元
+📌 每日均：{daily:.2f} 元'''
+    
+    # 添加负债/分期: 负债 名称 总金额 月数 (如: 负债 信用卡分期 12000 12)
+    match = re.match(r'^(?:添加)?负债\s+(\S+)\s+(\d+(?:\.\d+)?)\s+(\d+)$', content)
+    if match:
+        name = match.group(1)
+        total_amount = float(match.group(2))
+        total_months = int(match.group(3))
+        monthly = round(total_amount / total_months, 2)
+        daily = round(monthly / 30, 2)
+        add_recurring_expense(openid, 'debt', name,
+                              total_amount=total_amount, total_months=total_months)
+        return f'''✅ 已添加负债：{name}
+
+💰 总金额：{total_amount:,.0f} 元
+📅 分期数：{total_months} 个月
+📆 每月还：{monthly:,.2f} 元
+📌 每日均：{daily:.2f} 元'''
     
     # 删除固定开支/贷款: 删除 ID
     match = re.match(r'^删除\s+(\d+)$', content)
@@ -89,8 +179,129 @@ def parse_message(openid: str, content: str) -> str:
         else:
             return '❌ 未找到该记录'
     
+    # 家庭组功能
+    if content.startswith('创建家庭'):
+        name = content[4:].strip() or "我的家庭"
+        code = create_family(openid, name)
+        return f'👨‍👩‍👧‍👦 家庭「{name}」创建成功！\n\n邀请码：{code}\n\n发送「加入家庭 {code}」让另一半加入吧！'
+    
+    if content.startswith('加入家庭'):
+        code = content[4:].strip().upper()
+        if join_family(openid, code):
+            family = get_user_family(openid)
+            return f'✅ 成功加入家庭「{family["name"]}」！\n\n现在你们可以共享账本了。'
+        else:
+            return '❌ 邀请码无效，请检查后重试。'
+    
+    if content == '退出家庭':
+        if leave_family(openid):
+            return '👋 已成功退出家庭组。'
+        else:
+            return '❌ 您当前不在任何家庭组中。'
+
+    if content == '家庭':
+        family = get_user_family(openid)
+        if family:
+            return f'👨‍👩‍👧‍👦 当前家庭：{family["name"]}\n邀请码：{family["invite_code"]}\n身份：{"创建者" if family["role"] == "creator" else "成员"}'
+        else:
+            return '📋 您当前不在任何家庭组中。\n\n发送「创建家庭 名称」来创建一个吧！'
+    
+    if content == '家庭成员':
+        family = get_user_family(openid)
+        if not family:
+            return '❌ 您当前不在任何家庭组中。'
+        
+        members = get_family_members_detail(family['id'])
+        msg = f'👨‍👩‍👧‍👦 {family["name"]} 成员列表\n'
+        msg += '━━━━━━━━━━━━━━━━━\n'
+        
+        for i, m in enumerate(members):
+            role_icon = '👑' if m['role'] == 'creator' else '👤'
+            nickname = m['nickname'] or m['openid'][:8]
+            msg += f'{role_icon} {nickname}'
+            if m['role'] == 'creator':
+                msg += ' (创建者)'
+            msg += '\n'
+        
+        msg += f'\n邀请码：{family["invite_code"]}'
+        return msg
+    
+    if content == '家庭欠款':
+        family = get_user_family(openid)
+        if not family:
+            return '❌ 您当前不在任何家庭组中。'
+        
+        ranking = get_family_debt_ranking(family['id'])
+        
+        if ranking['total_daily'] == 0:
+            return '📋 家庭成员暂无欠款记录。\n\n发送「初始化」开始设置贷款和固定开支。'
+        
+        msg = f'''👨‍👩‍👧‍👦 {family["name"]} 欠款排行
+
+💸 每日合计：{ranking["total_daily"]:.2f} 元
+📅 每月合计：{ranking["total_monthly"]:,.2f} 元
+
+━━━━━━━━━━━━━━━━━'''
+        
+        medals = ['🥇', '🥈', '🥉']
+        for i, r in enumerate(ranking['ranking']):
+            medal = medals[i] if i < 3 else f'{i+1}.'
+            nickname = r['nickname'] or r['openid'][:8]
+            msg += f'\n{medal} {nickname}：-{r["daily"]:.2f}元/日'
+            
+            # 显示详情
+            if r['details']:
+                detail_names = [d['name'] for d in r['details'][:3]]
+                msg += f'\n   ({", ".join(detail_names)})'
+        
+        msg += '\n\n💪 大家一起努力搬砖！'
+        return msg
+    
+    # 初始化引导
+    if content in ['初始化', '设置', '开始', 'start', 'init']:
+        return get_init_guide()
+    
     # 未识别的指令
     return '❓ 无法识别的指令，发送"帮助"查看使用说明'
+
+
+def get_init_guide() -> str:
+    """返回初始化录入引导"""
+    return '''🚀 欢迎使用记账小助手！
+
+让我们来设置您的固定开支，这样每天都能提醒您"眼睛一睁欠了多少钱"💸
+
+━━━━━━━━━━━━━━━━━
+📍 第一步：添加贷款
+━━━━━━━━━━━━━━━━━
+格式：贷款 名称 总金额 月数
+
+🏠 房贷：贷款 房贷 1000000 360
+🚗 车贷：贷款 车贷 150000 60
+
+━━━━━━━━━━━━━━━━━
+📍 第二步：添加分期/负债
+━━━━━━━━━━━━━━━━━
+格式：负债 名称 总金额 月数
+
+💳 信用卡：负债 信用卡分期 12000 12
+📱 手机：负债 iPhone分期 8000 24
+
+━━━━━━━━━━━━━━━━━
+📍 第三步：添加固定开支
+━━━━━━━━━━━━━━━━━
+格式：固定 名称 月费
+
+🏢 物业：固定 物业 200
+🅿️ 停车：固定 停车 300
+📱 话费：固定 话费 100
+
+━━━━━━━━━━━━━━━━━
+📍 第四步：查看汇总
+━━━━━━━━━━━━━━━━━
+发送「欠款」查看每日欠款明细
+
+💡 提示：每条单独发送一条消息'''
 
 
 def get_help_message() -> str:
@@ -101,18 +312,30 @@ def get_help_message() -> str:
 • 支出 50 餐饮 午餐
 • 收入 1000 工资
 
-🏠 【贷款/固定开支】
-• 贷款 房贷 5000
+🏠 【贷款】(总额+月数)
+• 贷款 房贷 1000000 360
+• 贷款 车贷 150000 60
+
+💳 【负债/分期】
+• 负债 信用卡分期 12000 12
+• 负债 iPhone分期 8000 24
+
+📌 【固定开支】(月费)
 • 固定 物业 200
 • 固定 停车 300
-• 删除 1  (删除ID为1的项)
 
-📊 【查询统计】
-• 今日 - 查看今日收支
-• 本月 - 查看本月统计
-• 欠款 - 查看固定开支明细
+🗑️ 删除 1  (删除ID为1的项)
 
-💡 提示：每天早上会推送欠款提醒'''
+📊 【查询】
+• 今日/本月/欠款
+
+👨‍👩‍👧‍👦 【家庭组】
+• 创建家庭 名称
+• 加入家庭 邀请码
+• 家庭 - 查看状态
+• 退出家庭
+
+💡 发送「初始化」开始设置'''
 
 
 def get_today_report(openid: str) -> str:
@@ -170,19 +393,30 @@ def get_recurring_report(openid: str) -> str:
     debt = get_daily_debt(openid)
     
     if not expenses:
-        return '📋 暂无固定开支/贷款记录\n\n发送"贷款 房贷 5000"添加贷款\n发送"固定 物业 200"添加固定开支'
+        return '📋 暂无固定开支/贷款记录\n\n发送「初始化」开始设置贷款和固定开支'
     
-    msg = f'''🏠 固定开支明细
+    msg = f'''💸 每日欠款明细
 
-每日合计：{debt["daily_total"]:.2f} 元
-每月合计：{debt["monthly_total"]:.2f} 元
+📌 每日合计：{debt["daily_total"]:.2f} 元
+📅 每月合计：{debt["monthly_total"]:,.2f} 元
 
-📋 详细列表：'''
+━━━━━━━━━━━━━━━━━'''
+    
+    # 按类型分组显示
+    type_icons = {'loan': '🏠', 'debt': '💳', 'fixed': '📝'}
+    type_names = {'loan': '贷款', 'debt': '负债', 'fixed': '固定'}
     
     for e in expenses:
-        type_icon = '🏦' if e['type'] == 'loan' else '📝'
+        icon = type_icons.get(e['type'], '📌')
         daily = round(e['monthly_amount'] / 30, 2)
-        msg += f'\n{type_icon} [{e["id"]}] {e["name"]}：{e["monthly_amount"]}元/月 ({daily}元/日)'
+        
+        # 如果有总金额和月数，显示详情
+        if e.get('total_amount') and e.get('total_months'):
+            msg += f"\n{icon} [{e['id']}] {e['name']}"
+            msg += f"\n   总额{e['total_amount']:,.0f}÷{e['total_months']}月"
+            msg += f" = {e['monthly_amount']:,.0f}元/月 ({daily}元/日)"
+        else:
+            msg += f"\n{icon} [{e['id']}] {e['name']}：{e['monthly_amount']:,.0f}元/月 ({daily}元/日)"
     
     msg += '\n\n💡 发送"删除 ID"可删除对应项'
     
@@ -193,6 +427,7 @@ def get_daily_push_message(openid: str) -> str:
     """生成每日推送消息"""
     debt = get_daily_debt(openid)
     today_summary = get_today_summary(openid)
+    family = get_user_family(openid)
     
     # 计算今日净收入（考虑固定开支）
     daily_debt = debt['daily_total']
@@ -201,29 +436,50 @@ def get_daily_push_message(openid: str) -> str:
     net_income = today_income - today_expense - daily_debt
     
     # 生成推送消息
-    if daily_debt > 0:
+    if daily_debt > 0 or (family and get_family_debt_ranking(family['id'])['total_daily'] > 0):
         msg = f'''☀️ 早安！眼睛一睁
 
-💸 你今日的收入是：{net_income:.2f} 元
+💸 你今日的收入是：{net_income:,.2f} 元
 
-📊 欠款明细：'''
+📊 每日欠款明细：'''
         
+        type_icons = {'loan': '🏠', 'debt': '💳', 'fixed': '📝'}
         for d in debt['details']:
-            type_name = '贷款' if d['type'] == 'loan' else '固定'
-            msg += f'\n• {d["name"]}({type_name})：-{d["daily"]:.2f}元'
+            icon = type_icons.get(d['type'], '📌')
+            msg += f'\n{icon} {d["name"]}：-{d["daily"]:.2f}元'
         
         msg += f'''
 
-💰 每日固定支出：{daily_debt:.2f} 元
-📅 每月固定支出：{debt["monthly_total"]:.2f} 元
+━━━━━━━━━━━━━━━━━
+📌 每日欠款：{daily_debt:.2f} 元
+📅 每月欠款：{debt["monthly_total"]:,.2f} 元'''
 
-努力搬砖，今天也要加油！💪'''
+        # 如果在家庭组中，添加家庭排行
+        if family:
+            ranking = get_family_debt_ranking(family['id'])
+            if ranking['total_daily'] > 0:
+                msg += f'''
+
+👨‍👩‍👧‍👦 家庭欠款排行：'''
+                medals = ['🥇', '🥈', '🥉']
+                for i, r in enumerate(ranking['ranking']):
+                    if r['daily'] > 0:
+                        medal = medals[i] if i < 3 else f'{i+1}.'
+                        nickname = r['nickname'] or r['openid'][:8]
+                        msg += f'\n{medal} {nickname}：-{r["daily"]:.2f}元/日'
+                
+                msg += f'''
+
+💰 全家每日：{ranking["total_daily"]:.2f} 元
+📅 全家每月：{ranking["total_monthly"]:,.2f} 元'''
+        
+        msg += '\n\n💪 努力搬砖，今天也要加油！'
     else:
         msg = f'''☀️ 早安！
 
 昨日结余：{today_summary["balance"]:.2f} 元
 
 还没有设置固定开支哦~
-发送"帮助"查看如何添加贷款和固定开支'''
+发送「初始化」开始设置贷款和固定开支'''
     
     return msg

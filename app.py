@@ -55,7 +55,18 @@ def wechat():
     
     # 处理文本消息
     if msg.type == 'text':
-        response_text = handle_message(msg.source, msg.content)
+        # 定义通知回调函数
+        from wechatpy import WeChatClient
+        from config import WECHAT_APP_ID, WECHAT_APP_SECRET
+        client = WeChatClient(WECHAT_APP_ID, WECHAT_APP_SECRET)
+        
+        def notify_callback(target_openid, message):
+            try:
+                client.message.send_text(target_openid, message)
+            except Exception as e:
+                print(f"[通知失败] {target_openid}: {e}")
+
+        response_text = handle_message(msg.source, msg.content, notify_callback=notify_callback)
         reply = create_reply(response_text, msg)
         return reply.render()
     
@@ -63,12 +74,15 @@ def wechat():
     elif msg.type == 'event' and msg.event == 'subscribe':
         welcome = '''👋 欢迎使用记账小助手！
 
-发送"帮助"查看使用说明
+🚀 发送「初始化」开始设置您的贷款和固定开支
 
+每天早上提醒您：
+"眼睛一睁，欠款xxx元" 💸
+
+━━━━━━━━━━━━━━━━━
 💡 快速开始：
-• 发送"支出 20 餐饮"记录支出
-• 发送"贷款 房贷 5000"添加贷款
-• 发送"今日"查看今日统计'''
+• 初始化 - 设置贷款和固定开支
+• 帮助 - 查看所有功能'''
         reply = create_reply(welcome, msg)
         return reply.render()
     
