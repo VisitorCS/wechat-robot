@@ -91,16 +91,13 @@ init_database() {
     print_success "数据库初始化完成"
 }
 
-# 数据库迁移
+# 数据库迁移（创建新表）
 migrate_database() {
     print_info "执行数据库迁移..."
-    if [ -f "migrate.py" ]; then
-        source venv/bin/activate 2>/dev/null || true
-        python3 migrate.py
-        print_success "数据库迁移完成"
-    else
-        print_warning "migrate.py 不存在，跳过迁移"
-    fi
+    source venv/bin/activate 2>/dev/null || true
+    # init_db 使用 CREATE TABLE IF NOT EXISTS，会创建新表但不影响已有数据
+    python3 -c "from database import init_db; init_db()"
+    print_success "数据库迁移完成"
 }
 
 # 配置 systemd 服务

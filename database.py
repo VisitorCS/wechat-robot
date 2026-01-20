@@ -102,6 +102,16 @@ def init_db():
             )
         ''')
         
+        # 创建预算表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS budgets (
+                openid TEXT PRIMARY KEY,
+                monthly_amount REAL NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (openid) REFERENCES users(openid)
+            )
+        ''')
+        
         conn.commit()
         print("数据库初始化完成")
 
@@ -257,6 +267,102 @@ def get_month_summary(openid: str) -> dict:
             'days': days
         }
 
+
+def get_expense_history(openid: str, days: int = 30) -> list:
+    """获取用户历史记录"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, type, amount, category, description, 
+                   date(created_at) as date, time(created_at) as time
+            FROM expenses
+            WHERE openid = ? AND date(created_at) >= date('now', ?)
+            ORDER BY created_at DESC
+            LIMIT 50
+        ''', (openid, f'-{days} days'))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_category_stats(openid: str, days: int = 30) -> dict:
+    """获取分类统计"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT category, SUM(amount) as total, COUNT(*) as count
+            FROM expenses
+            WHERE openid = ? AND type = 'expense'
+            AND date(created_at) >= date('now', ?)
+            GROUP BY category
+            ORDER BY total DESC
+        ''', (openid, f'-{days} days'))
+        
+        categories = [dict(row) for row in cursor.fetchall()]
+        total = sum(c['total'] for c in categories)
+        
+        return {
+            'total': total,
+            'categories': categories
+        }
+
+
+def set_budget(openid: str, amount: float) -> bool:
+    """设置月预算"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO budgets (openid, monthly_amount, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        ''', (openid, amount))
+        conn.commit()
+        return True
+
+
+def get_budget(openid: str) -> dict:
+    """获取预算及使用情况"""
+    today = date.today()
+    month_start = today.replace(day=1).isoformat()
+    
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        
+        # 获取预算
+        cursor.execute('SELECT monthly_amount FROM budgets WHERE openid = ?', (openid,))
+        row = cursor.fetchone()
+        budget = row['monthly_amount'] if row else None
+        
+        # 获取本月支出
+        cursor.execute('''
+            SELECT COALESCE(SUM(amount), 0) as total
+            FROM expenses
+            WHERE openid = ? AND type = 'expense'
+            AND date(created_at) >= ?
+        ''', (openid, month_start))
+        spent = cursor.fetchone()['total']
+        
+        if budget:
+            remaining = budget - spent
+            percent = round(spent / budget * 100, 1) if budget > 0 else 0
+        else:
+            remaining = None
+            percent = None
+        
+        return {
+            'budget': budget,
+            'spent': spent,
+            'remaining': remaining,
+            'percent': percent
+        }
+
+
+def is_family_creator(openid: str) -> bool:
+    """检查用户是否为家庭创建人"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT role FROM family_members WHERE openid = ?
+        ''', (openid,))
+        row = cursor.fetchone()
+        return row and row['role'] == 'creator'
 
 def get_all_users() -> list:
     """获取所有用户的 OpenID 列表（用于每日推送）"""

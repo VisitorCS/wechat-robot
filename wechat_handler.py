@@ -10,7 +10,8 @@ from database import (
     add_recurring_expense, get_recurring_expenses, delete_recurring_expense,
     get_daily_debt, create_family, join_family, get_user_family, get_family_members, leave_family,
     get_family_members_detail, get_family_debt_ranking,
-    get_family_recurring_expenses, get_family_daily_debt, update_nickname
+    get_family_recurring_expenses, get_family_daily_debt, update_nickname,
+    get_expense_history, get_category_stats, set_budget, get_budget, is_family_creator
 )
 
 
@@ -171,14 +172,20 @@ def parse_message(openid: str, content: str, notify_callback=None) -> str:
 📆 每月还：{monthly:,.2f} 元
 📌 每日均：{daily:.2f} 元'''
     
-    # 删除固定开支/贷款: 删除 ID
+    # 删除固定开支/贷款: 删除 ID（仅家庭创建人可操作）
     match = re.match(r'^删除\s+(\d+)$', content)
     if match:
         expense_id = int(match.group(1))
+        family = get_user_family(openid)
+        
+        # 如果在家庭中，只有创建人可以删除
+        if family and not is_family_creator(openid):
+            return '❌ 只有家庭创建人才能删除记录'
+        
         if delete_recurring_expense(openid, expense_id):
             return f'✅ 已删除固定开支/贷款 (ID: {expense_id})'
         else:
-            return '❌ 未找到该记录'
+            return '❌ 未找到该记录或无权删除'
     
     # 家庭组功能
     if content.startswith('创建家庭'):
@@ -281,6 +288,100 @@ def parse_message(openid: str, content: str, notify_callback=None) -> str:
         msg += '\n\n💪 大家一起努力搬砖！'
         return msg
     
+    # 历史记录: 历史 [天数]
+    match = re.match(r'^历史(?:\s+(\d+))?$', content)
+    if match:
+        days = int(match.group(1)) if match.group(1) else 7
+        records = get_expense_history(openid, days)
+        
+        if not records:
+            return f'📋 最近{days}天暂无记账记录'
+        
+        msg = f'📋 最近{days}天记录\n'
+        msg += '─────────────────────'
+        
+        current_date = None
+        for r in records:
+            if r['date'] != current_date:
+                current_date = r['date']
+                msg += f'\n\n📅 {current_date}'
+            
+            icon = '💵' if r['type'] == 'income' else '💸'
+            category = r['category'] or '其他'
+            msg += f'\n{icon} {category} {r["amount"]:.0f}元'
+            if r['description']:
+                msg += f' ({r["description"]})'
+        
+        return msg
+    
+    # 分类统计: 统计 [分类] [天数]
+    match = re.match(r'^统计(?:\s+(\S+))?(?:\s+(\d+))?$', content)
+    if match:
+        category_filter = match.group(1)
+        days = int(match.group(2)) if match.group(2) else 30
+        
+        stats = get_category_stats(openid, days)
+        
+        if stats['total'] == 0:
+            return f'📊 最近{days}天暂无支出记录'
+        
+        msg = f'''📊 支出统计（{days}天）
+┌─────────────────────
+│ 💸 总支出：{stats["total"]:,.0f} 元
+└─────────────────────
+'''
+        
+        for c in stats['categories']:
+            cat_name = c['category'] or '其他'
+            percent = c['total'] / stats['total'] * 100
+            bar_len = int(percent / 10)
+            bar = '█' * bar_len + '░' * (10 - bar_len)
+            msg += f'\n{cat_name}：{c["total"]:,.0f}元'
+            msg += f'\n{bar} {percent:.0f}%'
+        
+        return msg
+    
+    # 预算设置: 预算 金额
+    match = re.match(r'^预算\s+(\d+(?:\.\d+)?)$', content)
+    if match:
+        amount = float(match.group(1))
+        set_budget(openid, amount)
+        return f'✅ 月预算已设置为：{amount:,.0f} 元'
+    
+    # 预算查看: 预算
+    if content == '预算':
+        budget_info = get_budget(openid)
+        
+        if not budget_info['budget']:
+            return '📋 您还未设置预算\n\n发送「预算 5000」设置月预算'
+        
+        budget = budget_info['budget']
+        spent = budget_info['spent']
+        remaining = budget_info['remaining']
+        percent = budget_info['percent']
+        
+        # 进度条
+        bar_len = min(int(percent / 10), 10)
+        bar = '█' * bar_len + '░' * (10 - bar_len)
+        
+        # 状态提示
+        if percent >= 100:
+            status = '🚨 已超支！'
+        elif percent >= 80:
+            status = '⚠️ 即将超支'
+        else:
+            status = '✅ 正常'
+        
+        return f'''💰 本月预算
+┌─────────────────────
+│ 预算：{budget:,.0f} 元
+│ 已用：{spent:,.0f} 元
+│ 剩余：{remaining:,.0f} 元
+└─────────────────────
+
+{bar} {percent:.0f}%
+{status}'''
+    
     # 初始化引导
     if content in ['初始化', '设置', '开始', 'start', 'init']:
         return get_init_guide()
@@ -336,28 +437,25 @@ def get_help_message() -> str:
 • 支出 50 餐饮 午餐
 • 收入 1000 工资
 
-🏠 【贷款】(总额+月数)
+🏠 【贷款】
 • 贷款 房贷 1000000 360
-• 贷款 车贷 150000 60
 
 💳 【负债/分期】
 • 负债 信用卡分期 12000 12
-• 负债 iPhone分期 8000 24
 
-📌 【固定开支】(月费)
+📌 【固定开支】
 • 固定 物业 200
-• 固定 停车 300
 
-🗑️ 删除 1  (删除ID为1的项)
-
-📊 【查询】
+📊 【查询统计】
 • 今日/本月/欠款
+• 历史 [天数]
+• 统计 [天数]
+• 预算 [金额]
 
 👨‍👩‍👧‍👦 【家庭组】
-• 创建家庭 名称
-• 加入家庭 邀请码
-• 家庭 - 查看状态
-• 退出家庭
+• 创建家庭/加入家庭
+• 家庭/家庭欠款
+• 昵称 名字
 
 💡 发送「初始化」开始设置'''
 
